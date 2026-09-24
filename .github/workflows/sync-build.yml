@@ -18,7 +18,7 @@ env:
   IMAGE_NAME: ghcr.io/viciy2023/cline2api-deploy
   # Docker Hub 上的仓库名（实际拉取地址 <DOCKERHUB_USERNAME>/cline2api）
   DOCKERHUB_REPO: cline2api
-  BUILD_REV: v1
+  BUILD_REV: v2
 
 jobs:
   check:
@@ -92,6 +92,24 @@ jobs:
       - name: Clone upstream source
         run: |
           git clone --depth 1 --branch ${{ env.UPSTREAM_BRANCH }} https://github.com/${{ env.UPSTREAM_REPO }}.git upstream
+
+      # Docker 无浏览器：openExternal 后端 openBrowser 找不到 xdg-open 会报
+      # "no browser opener found"。失败时回退到浏览器端 window.open。
+      # 上游若改动该函数则 patch 失败中断构建，避免静默漏补。
+      - name: Patch openExternal fallback for headless Docker
+        run: |
+          python3 - <<'PYEOF'
+          path = 'upstream/admin_html.go'
+          with open(path, encoding='utf-8') as f:
+              src = f.read()
+          old = "async function openExternal(url) {\n  try {\n    await api('GET', '/open-external?url=' + encodeURIComponent(url));\n    toast(t('已在系统浏览器中打开'), 'success');\n  } catch (e) { toast(t('打开失败: ') + e.message, 'error'); }\n}"
+          new = "async function openExternal(url) {\n  try {\n    await api('GET', '/open-external?url=' + encodeURIComponent(url));\n    toast(t('已在系统浏览器中打开'), 'success');\n  } catch (e) { window.open(url, '_blank'); }\n}"
+          if old not in src:
+              raise SystemExit('patch target not found - upstream openExternal changed, review needed')
+          with open(path, 'w', encoding='utf-8') as f:
+              f.write(src.replace(old, new, 1))
+          print('patched openExternal: fallback to window.open')
+          PYEOF
 
       # 组装推送的标签：GHCR 必推；Docker Hub 凭据没配置时就不推，避免挂掉整条流水线。
       - name: 组装推送的标签
