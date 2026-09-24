@@ -1,0 +1,154 @@
+name: Sync & Build cline2api
+
+# 定时克隆上游源码，用上游自带的 Dockerfile 构建镜像并推送两个 registry：
+#   ghcr.io/viciy2023/cline2api-deploy    推到 GHCR（免费，稳定）
+#   <用户名>/cline2api                    推到 Docker Hub（给 FNOS 拉取）
+#
+# 推送目标格式：<用户名>/<仓库名>:<标签>，一个标签占一个仓库。
+
+on:
+  schedule:
+    # 每 4 小时一次（UTC 00/04/08/12/16/20 = 北京 08/12/16/20/00/04 点）
+    - cron: '0 0,4,8,12,16,20 * * *'
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: luawei1/cline2api
+  UPSTREAM_BRANCH: main
+  IMAGE_NAME: ghcr.io/viciy2023/cline2api-deploy
+  # Docker Hub 上的仓库名（实际拉取地址 <DOCKERHUB_USERNAME>/cline2api）
+  DOCKERHUB_REPO: cline2api
+  BUILD_REV: v1
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.compare.outputs.changed }}
+      upstream_sha: ${{ steps.compare.outputs.upstream_sha }}
+      app_version: ${{ steps.compare.outputs.app_version }}
+    steps:
+      - name: Checkout deploy repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync upstream README
+        run: |
+          gh api repos/${{ env.UPSTREAM_REPO }}/contents/README.md \
+            --jq '.content' | base64 -d > README.md
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          if git diff --staged --quiet; then
+            echo "README unchanged."
+          else
+            git commit -m "docs: sync upstream README"
+            git pull --rebase origin main
+            git push
+            echo "README synced."
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get upstream latest SHA and version
+        id: compare
+        run: |
+          UPSTREAM_SHA=$(gh api repos/${{ env.UPSTREAM_REPO }}/commits/${{ env.UPSTREAM_BRANCH }} --jq '.sha')
+          echo "upstream_sha=$UPSTREAM_SHA" >> "$GITHUB_OUTPUT"
+          # 取上游最新 release tag 作为 APP_VERSION；无 tag 则用 dev
+          APP_VERSION=$(gh api "repos/${{ env.UPSTREAM_REPO }}/releases/latest" --jq '.tag_name' 2>/dev/null || echo "dev")
+          [ -z "$APP_VERSION" ] || [ "$APP_VERSION" = "null" ] && APP_VERSION="dev"
+          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+          LAST_LINE=$(cat last-build.txt 2>/dev/null | tr -d '[:space:]' || echo "")
+          echo "last_fp=$LAST_LINE"
+          WANT_FP="${UPSTREAM_SHA}${BUILD_REV}"
+          echo "want_fp=$WANT_FP  last_fp=$LAST_LINE"
+          if [ "$WANT_FP" = "$LAST_LINE" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No change detected (upstream ${UPSTREAM_SHA} + ${BUILD_REV}), skipping build."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Change detected: ${LAST_LINE:-<empty>} -> $WANT_FP"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout deploy repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone upstream source
+        run: |
+          git clone --depth 1 --branch ${{ env.UPSTREAM_BRANCH }} https://github.com/${{ env.UPSTREAM_REPO }}.git upstream
+
+      # 组装推送的标签：GHCR 必推；Docker Hub 凭据没配置时就不推，避免挂掉整条流水线。
+      - name: 组装推送的标签
+        id: tags
+        run: |
+          SHA="${{ needs.check.outputs.upstream_sha }}"
+          TAGS="${IMAGE_NAME}:latest,${IMAGE_NAME}:${SHA}"
+          if [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ] && [ -n "${{ secrets.DOCKERHUB_USERNAME }}" ]; then
+            DEST="docker.io/${{ secrets.DOCKERHUB_USERNAME }}/${DOCKERHUB_REPO}"
+            TAGS="${TAGS},${DEST}:latest,${DEST}:${SHA}"
+            echo "hub=true" >> "$GITHUB_OUTPUT"
+            echo "Docker Hub 凭据已配置，将同时推送 ${DEST}。"
+          else
+            echo "hub=false" >> "$GITHUB_OUTPUT"
+            echo "未配置 Docker Hub 凭据，镜像只推送到 GHCR。"
+          fi
+          echo "value=${TAGS}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        if: steps.tags.outputs.hub == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./upstream
+          push: true
+          build-args: |
+            APP_VERSION=${{ needs.check.outputs.app_version }}
+          tags: ${{ steps.tags.outputs.value }}
+
+      - name: Record built fingerprint
+        run: |
+          echo "${{ needs.check.outputs.upstream_sha }}${BUILD_REV}" > last-build.txt
+
+      - name: Commit last-build.txt
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last-build.txt
+          if git diff --staged --quiet; then
+            echo "No change to commit."
+          else
+            git commit -m "build: ${{ needs.check.outputs.upstream_sha }} ${{ needs.check.outputs.app_version }} ${BUILD_REV}"
+            git pull --rebase origin main
+            git push
+          fi
